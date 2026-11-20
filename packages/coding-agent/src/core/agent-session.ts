@@ -315,6 +315,7 @@ export type PromptInsertion = { clientMessageId: string; entryId: string; dispos
 type RpcPromptSubmission = {
 	clientMessageId: string;
 	inserted: (receipt: PromptInsertion) => void;
+	runScoped?: true;
 };
 
 /** Options for AgentSession.prompt() */
@@ -434,7 +435,7 @@ export class AgentSession {
 	private _turnIndex = 0;
 	private readonly _entryIdsByMessage = new WeakMap<object, string>();
 	private readonly _rpcSubmissionByMessage = new WeakMap<object, RpcPromptSubmission>();
-	private readonly _pendingRpcPrompts = new Map<string, Promise<PromptInsertion>>();
+	private readonly _pendingRpcPrompts = new Map<string, Promise<PromptInsertion | null>>();
 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
 	private _lastAssistantMessage: AssistantMessage | undefined;
 	private _lastActivityOutcome: AgentActivityOutcome = "completed";
@@ -1132,7 +1133,7 @@ export class AgentSession {
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
 			const messageText = contentText(event.message.content, "");
-			if (messageText) {
+			if (messageText && !this._rpcSubmissionByMessage.get(event.message)?.runScoped) {
 				// Check steering queue first
 				const steeringIndex = this._steeringMessages.indexOf(messageText);
 				if (steeringIndex !== -1) {
@@ -2203,23 +2204,16 @@ export class AgentSession {
 
 	/** Insert a prompt once under a caller-supplied message ID, even after reopening the session. */
 	async submitRpcPrompt(text: string, clientMessageId: string, images?: ImageContent[]): Promise<PromptInsertion> {
-		if (typeof clientMessageId !== "string" || clientMessageId.length === 0 || [...clientMessageId].length > 255) {
-			throw new Error("clientMessageId must be a string of 1 to 255 characters.");
-		}
+		this._validateRpcMessageId(clientMessageId);
 		const pending = this._pendingRpcPrompts.get(clientMessageId);
-		if (pending) return { ...(await pending), disposition: "reused" };
+		if (pending) {
+			const receipt = await pending;
+			if (receipt) return { ...receipt, disposition: "reused" };
+			return this.submitRpcPrompt(text, clientMessageId, images);
+		}
 
-		const sessionId = this.sessionManager.getSessionId();
-		const retained = this.sessionManager
-			.getEntries()
-			.find(
-				(entry) =>
-					entry.type === "message" &&
-					entry.message.role === "user" &&
-					entry.clientSubmission?.sessionId === sessionId &&
-					entry.clientSubmission.messageId === clientMessageId,
-			);
-		if (retained) return { clientMessageId, entryId: retained.id, disposition: "reused" };
+		const retained = this._retainedRpcInput(clientMessageId);
+		if (retained) return retained;
 
 		if (this.isStreaming || this._isEmittingAgentSettled || this._pendingRpcPrompts.size > 0) {
 			throw new Error("Cannot insert a keyed prompt while the agent is processing.");
@@ -2231,12 +2225,80 @@ export class AgentSession {
 				rpcSubmission: { clientMessageId, inserted: resolve },
 			}).then(() => reject(new Error("Pi did not insert a user message for this prompt.")), reject);
 		});
-		this._pendingRpcPrompts.set(clientMessageId, insertion);
-		try {
-			return await insertion;
-		} finally {
-			this._pendingRpcPrompts.delete(clientMessageId);
+		return this._trackRpcInput(clientMessageId, insertion);
+	}
+
+	/** Insert input into the current run, or leave it unconsumed if that run cannot accept it. */
+	async submitRpcSteering(text: string, clientMessageId: string): Promise<PromptInsertion | null> {
+		this._validateRpcMessageId(clientMessageId);
+		const pending = this._pendingRpcPrompts.get(clientMessageId);
+		if (pending) {
+			const receipt = await pending;
+			return receipt ? { ...receipt, disposition: "reused" } : null;
 		}
+
+		const retained = this._retainedRpcInput(clientMessageId);
+		if (retained) return retained;
+		const signal = this.agent.signal;
+		if (!signal || signal.aborted) return null;
+
+		return this._trackRpcInput(
+			clientMessageId,
+			(async () => {
+				if (text.startsWith("/")) this._throwIfExtensionCommand(text);
+				const input = await this._runInputHandlers(text, undefined, "rpc", "steer");
+				if (!input)
+					throw new Error("An input handler consumed the keyed steering message without native insertion.");
+				const expanded = expandPromptTemplate(this._expandSkillCommand(input.text), [...this.promptTemplates]);
+				const message: AgentMessage = {
+					role: "user",
+					content: [{ type: "text", text: expanded }, ...(input.images ?? [])],
+					timestamp: Date.now(),
+				};
+				const insertion = new Promise<PromptInsertion | null>((resolve) => {
+					this._rpcSubmissionByMessage.set(message, { clientMessageId, inserted: resolve, runScoped: true });
+					if (!this.agent.steerWhileRunning(message, signal)) {
+						resolve(null);
+						return;
+					}
+					void this.agent.waitForIdle().then(() => resolve(null));
+				});
+				try {
+					return await insertion;
+				} finally {
+					this._rpcSubmissionByMessage.delete(message);
+				}
+			})(),
+		);
+	}
+
+	private _validateRpcMessageId(clientMessageId: string): void {
+		if (typeof clientMessageId !== "string" || clientMessageId.length === 0 || [...clientMessageId].length > 255) {
+			throw new Error("clientMessageId must be a string of 1 to 255 characters.");
+		}
+	}
+
+	private _retainedRpcInput(clientMessageId: string): PromptInsertion | undefined {
+		const sessionId = this.sessionManager.getSessionId();
+		const retained = this.sessionManager
+			.getEntries()
+			.find(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "user" &&
+					entry.clientSubmission?.sessionId === sessionId &&
+					entry.clientSubmission.messageId === clientMessageId,
+			);
+		return retained && { clientMessageId, entryId: retained.id, disposition: "reused" };
+	}
+
+	private _trackRpcInput<T extends PromptInsertion | null>(
+		clientMessageId: string,
+		insertion: Promise<T>,
+	): Promise<T> {
+		const tracked = insertion.finally(() => this._pendingRpcPrompts.delete(clientMessageId));
+		this._pendingRpcPrompts.set(clientMessageId, tracked);
+		return tracked;
 	}
 
 	/**

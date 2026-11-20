@@ -174,6 +174,10 @@ class PendingMessageQueue {
 		return drained;
 	}
 
+	remove(messages: ReadonlySet<AgentMessage>): void {
+		if (messages.size > 0) this.messages = this.messages.filter((message) => !messages.has(message));
+	}
+
 	clear(): void {
 		this.messages = [];
 	}
@@ -183,6 +187,7 @@ type ActiveRun = {
 	promise: Promise<void>;
 	resolve: () => void;
 	abortController: AbortController;
+	runScopedSteering: Set<AgentMessage>;
 };
 
 /**
@@ -307,6 +312,15 @@ export class Agent {
 	/** Queue a message to be injected after the current assistant turn finishes. */
 	steer(message: AgentMessage): void {
 		this.steeringQueue.enqueue(message);
+	}
+
+	/** Queue input only for the still-running execution identified by its native signal. */
+	steerWhileRunning(message: AgentMessage, signal: AbortSignal): boolean {
+		const run = this.activeRun;
+		if (!run || run.abortController.signal !== signal || signal.aborted) return false;
+		run.runScopedSteering.add(message);
+		this.steeringQueue.enqueue(message);
+		return true;
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
@@ -524,7 +538,7 @@ export class Agent {
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
 		});
-		this.activeRun = { promise, resolve: resolvePromise, abortController };
+		this.activeRun = { promise, resolve: resolvePromise, abortController, runScopedSteering: new Set() };
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
@@ -561,7 +575,10 @@ export class Agent {
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
-		this.activeRun?.resolve();
+		if (this.activeRun) {
+			this.steeringQueue.remove(this.activeRun.runScopedSteering);
+			this.activeRun.resolve();
+		}
 		this.activeRun = undefined;
 	}
 

@@ -27,6 +27,7 @@ export type RpcCommand =
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
 	| { id?: string; type: "prompt_with_id"; message: string; images?: ImageContent[]; clientMessageId: string }
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
+	| { id?: string; type: "steer_with_id"; message: string; clientMessageId: string }
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "clear_queue" }
@@ -124,6 +125,13 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "prompt"; success: true; data: { disposition: PromptDisposition } }
 	| { id?: string; type: "response"; command: "prompt_with_id"; success: true; data: PromptInsertion }
 	| { id?: string; type: "response"; command: "steer"; success: true; data: { disposition: QueuedInputDisposition } }
+	| {
+			id?: string;
+			type: "response";
+			command: "steer_with_id";
+			success: true;
+			data: { receipt: PromptInsertion | null };
+	  }
 	| {
 			id?: string;
 			type: "response";

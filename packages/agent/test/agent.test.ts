@@ -747,6 +747,42 @@ describe("Agent", () => {
 		await firstPrompt.catch(() => {}); // Ignore abort error
 	});
 
+	it("expires scoped steering at the native run boundary without clearing the legacy queue", async () => {
+		const requested = Promise.withResolvers<void>();
+		const agent = new Agent({
+			streamFn: (_model, _context, options) => {
+				const stream = createAssistantMessageEventStream();
+				const signal = options?.signal;
+				const stop = () =>
+					stream.push({
+						type: "error",
+						reason: "aborted",
+						error: { ...createAssistantMessage("Aborted"), stopReason: "aborted" },
+					});
+				if (signal?.aborted) stop();
+				else signal?.addEventListener("abort", stop, { once: true });
+				requested.resolve();
+				return stream;
+			},
+		});
+		const run = agent.prompt("Foreground");
+		await requested.promise;
+		const signal = agent.signal!;
+		try {
+			expect(agent.steerWhileRunning(createUserMessage("Scoped"), signal)).toBe(true);
+			const legacy = createUserMessage("Legacy");
+			agent.steer(legacy);
+			agent.abort();
+			expect(agent.steerWhileRunning(createUserMessage("After abort"), signal)).toBe(false);
+			await run;
+			expect(agent.peekQueuedMessages()).toEqual([legacy]);
+			expect(agent.steerWhileRunning(createUserMessage("After settlement"), signal)).toBe(false);
+		} finally {
+			agent.abort();
+			await run;
+		}
+	});
+
 	it("should throw when continue() called while streaming", async () => {
 		let abortSignal: AbortSignal | undefined;
 		const agent = new Agent({

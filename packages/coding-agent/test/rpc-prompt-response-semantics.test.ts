@@ -166,6 +166,7 @@ async function createRuntimeHost(options: {
 
 async function startRpcMode(options: Parameters<typeof createRuntimeHost>[0]): Promise<{
 	lineHandler: (line: string) => void;
+	runtimeHost: AgentSessionRuntime;
 	cleanup: () => Promise<void>;
 }> {
 	rpcIo.outputLines = [];
@@ -181,6 +182,7 @@ async function startRpcMode(options: Parameters<typeof createRuntimeHost>[0]): P
 
 	return {
 		lineHandler: rpcIo.lineHandler!,
+		runtimeHost,
 		cleanup: async () => {
 			for (const [signal, existing] of signals) {
 				for (const listener of process.listeners(signal)) {
@@ -269,6 +271,90 @@ describe("RPC prompt response semantics", () => {
 			}
 		} finally {
 			rmSync(sessionDir, { recursive: true, force: true });
+		}
+	});
+
+	it("limits keyed steering to the native run and retains its committed receipt", async () => {
+		const directory = join(tmpdir(), `pi-steering-keyed-${crypto.randomUUID()}`);
+		mkdirSync(directory);
+		const sessionManager = SessionManager.create(directory, directory);
+		const file = sessionManager.getSessionFile()!;
+		const gate = Promise.withResolvers<void>();
+		const request = (id: string, clientMessageId = "steer-one") =>
+			JSON.stringify({ id, type: "steer_with_id", clientMessageId, message: "Change direction" });
+		const replies = (id: string) => getPromptResponses(rpcIo.outputLines, id, "steer_with_id");
+		const first = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			responseGate: gate.promise,
+			sessionManager,
+		});
+		try {
+			first.lineHandler(request("idle"));
+			await vi.waitFor(() => expect(replies("idle")[0]).toMatchObject({ success: true, data: { receipt: null } }));
+			expect(parseOutputLines(rpcIo.outputLines).filter((record) => record.type === "agent_start")).toHaveLength(0);
+
+			first.lineHandler(JSON.stringify({ id: "prompt", type: "prompt", message: "Start" }));
+			await vi.waitFor(() =>
+				expect(parseOutputLines(rpcIo.outputLines).filter((record) => record.type === "agent_start")).toHaveLength(
+					1,
+				),
+			);
+			first.lineHandler(request("active"));
+			first.lineHandler(request("duplicate"));
+			await vi.waitFor(() => expect(first.runtimeHost.session.agent.hasQueuedMessages()).toBe(true));
+			expect(replies("active")).toHaveLength(0);
+			gate.resolve();
+			await vi.waitFor(() => {
+				expect(replies("active")[0]).toMatchObject({
+					success: true,
+					data: { receipt: { disposition: "inserted" } },
+				});
+				expect(replies("duplicate")[0]).toMatchObject({
+					success: true,
+					data: { receipt: { disposition: "reused" } },
+				});
+			});
+			await vi.waitFor(() =>
+				expect(
+					parseOutputLines(rpcIo.outputLines).filter((record) => record.type === "agent_settled"),
+				).toHaveLength(1),
+			);
+			const rows = SessionManager.open(file)
+				.getEntries()
+				.filter(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "user" &&
+						entry.clientSubmission?.messageId === "steer-one",
+				);
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({ message: { content: [{ type: "text", text: "Change direction" }] } });
+			await first.cleanup();
+
+			const reopened = await startRpcMode({
+				withAuth: false,
+				responseDelayMs: 0,
+				sessionManager: SessionManager.open(file),
+			});
+			try {
+				reopened.lineHandler(request("cold"));
+				await vi.waitFor(() =>
+					expect(replies("cold")[0]).toMatchObject({
+						success: true,
+						data: { receipt: { entryId: rows[0]!.id, disposition: "reused" } },
+					}),
+				);
+				expect(parseOutputLines(rpcIo.outputLines).filter((record) => record.type === "agent_start")).toHaveLength(
+					0,
+				);
+			} finally {
+				await reopened.cleanup();
+			}
+		} finally {
+			gate.resolve();
+			await first.cleanup();
+			rmSync(directory, { recursive: true, force: true });
 		}
 	});
 

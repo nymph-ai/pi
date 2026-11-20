@@ -418,6 +418,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "prompt_with_id", receipt);
 			}
 
+			case "steer_with_id": {
+				const receipt = await session.submitRpcSteering(command.message, command.clientMessageId);
+				return success(id, "steer_with_id", { receipt });
+			}
+
 			case "steer": {
 				const disposition = await session.steer(command.message, command.images, { source: "rpc" });
 				return success(id, "steer", { disposition });
