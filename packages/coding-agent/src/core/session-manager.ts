@@ -21,6 +21,8 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	renameSync,
+	rmSync,
 	type Stats,
 	statSync,
 	writeFileSync,
@@ -1637,12 +1639,58 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Store a copy of the selected native prefix without changing the source session or its active branch. */
+	createForkSnapshot(anchor?: { entryId: string; position: "before" | "after" }): {
+		sessionId: string;
+		sessionFile: string;
+	} | null {
+		const header = this.getHeader();
+		if (!this.persist || !this.sessionFile || !header) {
+			throw new Error("Fork snapshots require a persistent source session.");
+		}
+		const branch = this.getBranch();
+		let leaf = branch.length - 1;
+		if (anchor) {
+			const index = branch.findIndex((entry) => entry.id === anchor.entryId);
+			if (index === -1) return null;
+			leaf = anchor.position === "before" ? index - 1 : index;
+		}
+		const leafId = branch[leaf]?.id;
+
+		const snapshot = new SessionManager(this.cwd, this.sessionDir, undefined, true, undefined, [
+			header,
+			...branch.slice(0, leaf + 1),
+		]);
+		snapshot.sessionFile = this.sessionFile;
+		const target =
+			leafId === undefined
+				? snapshot.newSession({ parentSession: this.sessionFile })
+				: snapshot.createBranchedSession(leafId, { deferWrite: true });
+		if (!target) throw new Error("Pi could not allocate a session file for the fork.");
+
+		const temporary = `${target}.${randomUUID()}.tmp`;
+		const fd = openSync(temporary, "wx", 0o600);
+		try {
+			try {
+				for (const entry of snapshot.fileEntries) {
+					writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+				}
+			} finally {
+				closeSync(fd);
+			}
+			renameSync(temporary, target);
+		} finally {
+			rmSync(temporary, { force: true });
+		}
+		return { sessionId: snapshot.sessionId, sessionFile: target };
+	}
+
 	/**
 	 * Create a new session file containing only the path from root to the specified leaf.
 	 * Useful for extracting a single conversation path from a branched session.
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
-	createBranchedSession(leafId: string): string | undefined {
+	createBranchedSession(leafId: string, options?: { deferWrite?: boolean }): string | undefined {
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
@@ -1729,7 +1777,7 @@ export class SessionManager {
 
 			// Use the same rule as _persist(): write now if the branched path already
 			// has a conversation, otherwise let _persist() create the file later.
-			if (this._hasConversation()) {
+			if (!options?.deferWrite && this._hasConversation()) {
 				this._rewriteFile();
 				this.flushed = true;
 			} else {

@@ -626,6 +626,26 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
 			}
 
+			case "fork_snapshot": {
+				const { anchor } = command;
+				if (
+					anchor !== undefined &&
+					(!anchor ||
+						typeof anchor.entryId !== "string" ||
+						(anchor.position !== "before" && anchor.position !== "after"))
+				) {
+					return error(id, "fork_snapshot", "Expected an exact native entry anchor.");
+				}
+				if (!anchor && session.isStreaming) {
+					return error(
+						id,
+						"fork_snapshot",
+						"Wait for the source session to settle before forking its whole history.",
+					);
+				}
+				return success(id, "fork_snapshot", session.sessionManager.createForkSnapshot(anchor));
+			}
+
 			case "clone": {
 				const leafId = session.sessionManager.getLeafId();
 				if (!leafId) {

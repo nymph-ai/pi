@@ -472,3 +472,45 @@ describe("SessionManager session file creation", () => {
 		expect(readSessionFileRoles(session.getSessionFile()!)).toEqual(["session", "user", "custom", "assistant"]);
 	});
 });
+
+describe("native fork snapshots", () => {
+	it("durably preserves an exact prefix without modifying the live source", () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-fork-snapshot-"));
+		try {
+			const source = SessionManager.create(directory, directory);
+			const first = source.appendMessage(userMsg("first"), "retained-key");
+			const answer = source.appendMessage(assistantMsg("answer"));
+			const second = source.appendMessage(userMsg("second"));
+			source.appendLabelChange(first, "later metadata");
+			const before = readFileSync(source.getSessionFile()!, "utf8");
+
+			const empty = source.createForkSnapshot({ entryId: first, position: "before" })!;
+			const emptySession = SessionManager.open(empty.sessionFile);
+			expect(emptySession.getSessionId()).toBe(empty.sessionId);
+			expect(emptySession.getBranch()).toEqual([]);
+
+			const prefix = source.createForkSnapshot({ entryId: answer, position: "after" })!;
+			const retained = SessionManager.open(prefix.sessionFile);
+			expect(retained.getSessionId()).toBe(prefix.sessionId);
+			expect(retained.getHeader()?.parentSession).toBe(source.getSessionFile());
+			expect(retained.getBranch().map((entry) => entry.id)).toEqual([first, answer]);
+			expect(retained.getEntry(first)).toMatchObject({
+				clientSubmission: { sessionId: source.getSessionId(), messageId: "retained-key" },
+			});
+			expect(retained.getLabel(first)).toBeUndefined();
+
+			const whole = SessionManager.open(source.createForkSnapshot()!.sessionFile);
+			expect(
+				whole
+					.getBranch()
+					.filter((entry) => entry.type === "message")
+					.map((entry) => entry.id),
+			).toEqual([first, answer, second]);
+			expect(readFileSync(source.getSessionFile()!, "utf8")).toBe(before);
+			source.branch(answer);
+			expect(source.createForkSnapshot({ entryId: second, position: "before" })).toBeNull();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+});
