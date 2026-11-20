@@ -107,16 +107,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			};
 
 			const onAbort = () => {
+				if (!pendingExtensionRequests.has(id)) return;
 				cleanup();
+				if (process.env.PI_RPC_EXTENSION_UI_WITHDRAWAL === "1") {
+					output({ type: "extension_ui_cancelled", id });
+				}
 				resolve(defaultValue);
 			};
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
 			if (opts?.timeout) {
-				timeoutId = setTimeout(() => {
-					cleanup();
-					resolve(defaultValue);
-				}, opts.timeout);
+				timeoutId = setTimeout(onAbort, opts.timeout);
 			}
 
 			pendingExtensionRequests.set(id, {

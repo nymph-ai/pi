@@ -573,6 +573,43 @@ describe("RPC prompt response semantics", () => {
 		}
 	});
 
+	it("reports an opted-in extension confirmation withdrawal with the original dialog ID", async () => {
+		const controller = new AbortController();
+		const result = vi.fn();
+		const { lineHandler, cleanup } = await startRpcMode({
+			withAuth: false,
+			responseDelayMs: 0,
+			extensionsResult: await createTestExtensionsResult([
+				(pi) => {
+					pi.on("input", async (_event, ctx) => {
+						result(await ctx.ui.confirm("Confirm", "Test", { signal: controller.signal }));
+						return { action: "handled" };
+					});
+				},
+			]),
+		});
+
+		vi.stubEnv("PI_RPC_EXTENSION_UI_WITHDRAWAL", "1");
+		try {
+			lineHandler(JSON.stringify({ id: "prompt-id", type: "prompt", message: "Test" }));
+			const dialog = await vi.waitFor(() => {
+				const request = parseOutputLines(rpcIo.outputLines).find((line) => line.type === "extension_ui_request");
+				expect(request).toMatchObject({ id: expect.any(String), method: "confirm" });
+				return request!;
+			});
+			controller.abort();
+			lineHandler(JSON.stringify({ type: "extension_ui_response", id: dialog.id, confirmed: true }));
+			await vi.waitFor(() => expect(result.mock.calls).toEqual([[false]]));
+			expect(parseOutputLines(rpcIo.outputLines).filter((line) => line.type === "extension_ui_cancelled")).toEqual([
+				{ type: "extension_ui_cancelled", id: dialog.id },
+			]);
+		} finally {
+			vi.unstubAllEnvs();
+			controller.abort();
+			await cleanup();
+		}
+	});
+
 	it("returns and clears queued steering and follow-up messages", async () => {
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 500 });
 

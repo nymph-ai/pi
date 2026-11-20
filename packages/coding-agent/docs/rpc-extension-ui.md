@@ -9,6 +9,8 @@ There are two categories of extension UI methods:
 
 If a dialog method includes a `timeout` field, the agent-side will auto-resolve with a default value when the timeout expires. The client does not need to track timeouts.
 
+Set `PI_RPC_EXTENSION_UI_WITHDRAWAL=1` to receive an `{"type":"extension_ui_cancelled","id":"<request id>"}` event when an emitted `select`, `confirm`, or `input` dialog resolves to its default due to its own signal or timeout. Pi ignores subsequent responses to that dialog ID.
+
 ## Limitations
 
 Some `ExtensionUIContext` methods are not supported or degraded in RPC mode because they require direct terminal UI access:
