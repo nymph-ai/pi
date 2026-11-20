@@ -43,6 +43,24 @@ Response:
 
 The `images` field is optional. Each image uses `ImageContent` format: `{"type": "image", "data": "base64-encoded-data", "mimeType": "image/png"}`.
 
+### prompt_with_id
+
+Insert a user message under a caller-supplied identity. The command accepts a
+`message`, optional `images`, and a `clientMessageId` of 1 to 255 characters.
+
+```json
+{"type":"prompt_with_id","id":"req-2","message":"Review this file","clientMessageId":"submission-1"}
+{"type":"response","id":"req-2","command":"prompt_with_id","success":true,"data":{"clientMessageId":"submission-1","entryId":"a1b2c3d4","disposition":"inserted"}}
+```
+
+Pi replies after appending the native user message. The reply carries the
+session entry ID, and foreground work may still be running. A retry on the
+same session returns the original receipt with `disposition: "reused"`,
+including after reopening persisted history. An unseen ID requires an idle
+session. If input handling consumes the prompt without inserting a user
+message, the command fails without a receipt. Clients should still follow
+`agent_settled` for the outcome of a newly inserted prompt.
+
 ### steer
 
 Queue a steering message while the agent is running. It is delivered after the current assistant turn finishes executing its tool calls, before the next LLM call. Skill commands and prompt templates are expanded. Extension commands are not allowed (use `prompt` instead).

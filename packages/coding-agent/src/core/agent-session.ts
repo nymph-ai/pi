@@ -310,6 +310,12 @@ export interface ExtensionBindings {
 
 export type QueuedInputDisposition = "handled" | "queued";
 export type PromptDisposition = QueuedInputDisposition | "started";
+export type PromptInsertion = { clientMessageId: string; entryId: string; disposition: "inserted" | "reused" };
+
+type RpcPromptSubmission = {
+	clientMessageId: string;
+	inserted: (receipt: PromptInsertion) => void;
+};
 
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
@@ -323,6 +329,8 @@ export interface PromptOptions {
 	source?: InputSource;
 	/** Internal hook used by RPC mode to observe how an accepted prompt was dispatched. Not called if the prompt is rejected. */
 	preflightResult?: (disposition: PromptDisposition) => void;
+	/** Internal correlation for an RPC prompt awaiting native insertion. */
+	rpcSubmission?: RpcPromptSubmission;
 }
 
 /** Options for model/thinking mutations. */
@@ -425,6 +433,8 @@ export class AgentSession {
 	private _extensionRunner!: ExtensionRunner;
 	private _turnIndex = 0;
 	private readonly _entryIdsByMessage = new WeakMap<object, string>();
+	private readonly _rpcSubmissionByMessage = new WeakMap<object, RpcPromptSubmission>();
+	private readonly _pendingRpcPrompts = new Map<string, Promise<PromptInsertion>>();
 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
 	private _lastAssistantMessage: AssistantMessage | undefined;
 	private _lastActivityOutcome: AgentActivityOutcome = "completed";
@@ -1162,7 +1172,12 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				entryId = this.sessionManager.appendMessage(event.message);
+				const submission = this._rpcSubmissionByMessage.get(event.message);
+				entryId = this.sessionManager.appendMessage(event.message, submission?.clientMessageId);
+				if (submission) {
+					this._rpcSubmissionByMessage.delete(event.message);
+					submission.inserted({ clientMessageId: submission.clientMessageId, entryId, disposition: "inserted" });
+				}
 			}
 			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
@@ -1870,12 +1885,16 @@ export class AgentSession {
 	 * starting another, and an abort requested meanwhile aborts the run as soon as it exists.
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
-	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
+	private async _startRun(
+		trigger: BeforeAgentStartTrigger,
+		onStarted?: () => void,
+		rpcSubmission?: RpcPromptSubmission,
+	): Promise<void> {
 		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
 		let messages: AgentMessage[];
 		try {
-			messages = await this._prepareRun(trigger);
+			messages = await this._prepareRun(trigger, rpcSubmission);
 		} catch (error) {
 			this._isAgentRunActive = false;
 			this._flushPendingBashMessages();
@@ -1923,7 +1942,10 @@ export class AgentSession {
 	 * message followed by pending nextTurn messages (consumed here) and handler messages, with a
 	 * system patch first when the prompt changed.
 	 */
-	private async _prepareRun(trigger: BeforeAgentStartTrigger): Promise<AgentMessage[]> {
+	private async _prepareRun(
+		trigger: BeforeAgentStartTrigger,
+		rpcSubmission?: RpcPromptSubmission,
+	): Promise<AgentMessage[]> {
 		// Check if we need to compact before sending (catches aborted responses).
 		// The starting message is sent below, so do not call agent.continue() here.
 		const lastAssistant = this._findLastAssistantMessage();
@@ -1950,11 +1972,13 @@ export class AgentSession {
 			const normalized = await this._normalizePromptImages(trigger.images);
 			const text =
 				normalized.hints.length > 0 ? `${trigger.prompt}\n\n${normalized.hints.join("\n")}` : trigger.prompt;
-			messages.push({
+			const userMessage: AgentMessage = {
 				role: "user",
 				content: [{ type: "text", text }, ...normalized.images],
 				timestamp: Date.now(),
-			});
+			};
+			if (rpcSubmission) this._rpcSubmissionByMessage.set(userMessage, rpcSubmission);
+			messages.push(userMessage);
 		}
 		// Inject any pending "nextTurn" messages as context alongside the starting message
 		messages.push(...this._pendingNextTurnMessages);
@@ -2135,6 +2159,7 @@ export class AgentSession {
 
 		// If streaming, queue via steer() or followUp() based on option
 		if (this.isStreaming) {
+			if (options?.rpcSubmission) throw new Error("Cannot insert a keyed prompt while the agent is processing.");
 			if (!options?.streamingBehavior) {
 				throw new Error(
 					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
@@ -2169,9 +2194,49 @@ export class AgentSession {
 			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 		}
 
-		await this._startRun({ messageType: "user", prompt: expandedText, images: currentImages }, () =>
-			preflightResult?.("started"),
+		await this._startRun(
+			{ messageType: "user", prompt: expandedText, images: currentImages },
+			() => preflightResult?.("started"),
+			options?.rpcSubmission,
 		);
+	}
+
+	/** Insert a prompt once under a caller-supplied message ID, even after reopening the session. */
+	async submitRpcPrompt(text: string, clientMessageId: string, images?: ImageContent[]): Promise<PromptInsertion> {
+		if (typeof clientMessageId !== "string" || clientMessageId.length === 0 || [...clientMessageId].length > 255) {
+			throw new Error("clientMessageId must be a string of 1 to 255 characters.");
+		}
+		const pending = this._pendingRpcPrompts.get(clientMessageId);
+		if (pending) return { ...(await pending), disposition: "reused" };
+
+		const sessionId = this.sessionManager.getSessionId();
+		const retained = this.sessionManager
+			.getEntries()
+			.find(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "user" &&
+					entry.clientSubmission?.sessionId === sessionId &&
+					entry.clientSubmission.messageId === clientMessageId,
+			);
+		if (retained) return { clientMessageId, entryId: retained.id, disposition: "reused" };
+
+		if (this.isStreaming || this._isEmittingAgentSettled || this._pendingRpcPrompts.size > 0) {
+			throw new Error("Cannot insert a keyed prompt while the agent is processing.");
+		}
+		const insertion = new Promise<PromptInsertion>((resolve, reject) => {
+			void this.prompt(text, {
+				images,
+				source: "rpc",
+				rpcSubmission: { clientMessageId, inserted: resolve },
+			}).then(() => reject(new Error("Pi did not insert a user message for this prompt.")), reject);
+		});
+		this._pendingRpcPrompts.set(clientMessageId, insertion);
+		try {
+			return await insertion;
+		} finally {
+			this._pendingRpcPrompts.delete(clientMessageId);
+		}
 	}
 
 	/**

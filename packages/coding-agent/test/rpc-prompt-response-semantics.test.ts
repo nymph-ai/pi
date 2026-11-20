@@ -72,9 +72,9 @@ function parseOutputLines(outputLines: string[]): ParsedOutputLine[] {
 		.map((line) => JSON.parse(line) as ParsedOutputLine);
 }
 
-function getPromptResponses(outputLines: string[], id: string): ParsedOutputLine[] {
+function getPromptResponses(outputLines: string[], id: string, command = "prompt"): ParsedOutputLine[] {
 	return parseOutputLines(outputLines).filter(
-		(record) => record.id === id && record.type === "response" && record.command === "prompt",
+		(record) => record.id === id && record.type === "response" && record.command === command,
 	);
 }
 
@@ -87,6 +87,8 @@ async function createRuntimeHost(options: {
 	responseDelayMs: number;
 	model?: Model<any>;
 	extensionsResult?: LoadExtensionsResult;
+	sessionManager?: SessionManager;
+	responseGate?: Promise<void>;
 }): Promise<{
 	runtimeHost: AgentSessionRuntime;
 	cleanup: () => Promise<void>;
@@ -111,14 +113,16 @@ async function createRuntimeHost(options: {
 			queueMicrotask(() => {
 				stream.push({ type: "start", partial: createAssistantMessage("") });
 				setTimeout(() => {
-					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
+					void (options.responseGate ?? Promise.resolve()).then(() =>
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") }),
+					);
 				}, options.responseDelayMs);
 			});
 			return stream;
 		},
 	});
 
-	const sessionManager = SessionManager.inMemory();
+	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
 	const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 	const modelRegistry = await createInMemoryModelRegistry(authStorage);
@@ -168,16 +172,104 @@ async function startRpcMode(options: Parameters<typeof createRuntimeHost>[0]): P
 	rpcIo.lineHandler = undefined;
 
 	const { runtimeHost, cleanup } = await createRuntimeHost(options);
+	const signals = new Map(
+		(["SIGTERM", "SIGHUP"] as const).map((signal) => [signal, new Set(process.listeners(signal))] as const),
+	);
+	const stdinEndListeners = new Set(process.stdin.listeners("end"));
 	void runRpcMode(runtimeHost);
 	await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
 
-	return { lineHandler: rpcIo.lineHandler!, cleanup };
+	return {
+		lineHandler: rpcIo.lineHandler!,
+		cleanup: async () => {
+			for (const [signal, existing] of signals) {
+				for (const listener of process.listeners(signal)) {
+					if (!existing.has(listener)) process.removeListener(signal, listener);
+				}
+			}
+			for (const listener of process.stdin.listeners("end")) {
+				if (!stdinEndListeners.has(listener)) process.stdin.removeListener("end", listener as () => void);
+			}
+			await cleanup();
+		},
+	};
 }
 
 describe("RPC prompt response semantics", () => {
 	afterEach(() => {
 		rpcIo.outputLines = [];
 		rpcIo.lineHandler = undefined;
+	});
+
+	it("records a keyed user entry once before replying and reuses it after reopening", async () => {
+		const sessionDir = join(tmpdir(), `pi-rpc-keyed-${crypto.randomUUID()}`);
+		mkdirSync(sessionDir);
+		const sessionManager = SessionManager.create(sessionDir, sessionDir);
+		const file = sessionManager.getSessionFile()!;
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const request = (id: string, message = "Hello") =>
+			JSON.stringify({ id, type: "prompt_with_id", clientMessageId: "one", message });
+		const receipts = (id: string) => getPromptResponses(rpcIo.outputLines, id, "prompt_with_id");
+		let entryId!: string;
+		try {
+			const first = await startRpcMode({ withAuth: true, responseDelayMs: 0, responseGate: gate, sessionManager });
+			try {
+				first.lineHandler(request("original"));
+				first.lineHandler(request("duplicate", "Do not insert this"));
+				await vi.waitFor(() => {
+					expect(receipts("original")).toHaveLength(1);
+					expect(receipts("duplicate")).toHaveLength(1);
+				});
+				const entries = SessionManager.open(file).getEntries();
+				const users = entries.filter((entry) => entry.type === "message" && entry.message.role === "user");
+				expect(users).toHaveLength(1);
+				expect(users[0]).toMatchObject({
+					message: { content: [{ type: "text", text: "Hello" }] },
+					clientSubmission: { sessionId: sessionManager.getSessionId(), messageId: "one" },
+				});
+				entryId = users[0]!.id;
+				expect(receipts("original")[0]).toMatchObject({
+					success: true,
+					data: { clientMessageId: "one", entryId, disposition: "inserted" },
+				});
+				expect(receipts("duplicate")[0]).toMatchObject({
+					success: true,
+					data: { clientMessageId: "one", entryId, disposition: "reused" },
+				});
+				expect(parseOutputLines(rpcIo.outputLines).some((record) => record.type === "agent_settled")).toBe(false);
+				release();
+				await vi.waitFor(() =>
+					expect(parseOutputLines(rpcIo.outputLines).some((record) => record.type === "agent_settled")).toBe(true),
+				);
+			} finally {
+				release();
+				await first.cleanup();
+			}
+			const reopened = await startRpcMode({
+				withAuth: false,
+				responseDelayMs: 0,
+				sessionManager: SessionManager.open(file),
+			});
+			try {
+				reopened.lineHandler(request("retry", "Do not insert this either"));
+				await vi.waitFor(() =>
+					expect(receipts("retry")).toEqual([
+						expect.objectContaining({
+							success: true,
+							data: { clientMessageId: "one", entryId, disposition: "reused" },
+						}),
+					]),
+				);
+				expect(parseOutputLines(rpcIo.outputLines).some((record) => record.type === "agent_start")).toBe(false);
+			} finally {
+				await reopened.cleanup();
+			}
+		} finally {
+			rmSync(sessionDir, { recursive: true, force: true });
+		}
 	});
 
 	it("emits one failure response when prompt preflight rejects", async () => {
