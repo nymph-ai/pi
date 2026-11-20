@@ -67,7 +67,7 @@ export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
 	/** Identity of a submission owned by the session that recorded it. */
-	clientSubmission?: { sessionId: string; messageId: string };
+	clientSubmission?: { sessionId: string; messageId: string; clientContent?: string };
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -1213,7 +1213,11 @@ export class SessionManager {
 	 * so it is easier to find them.
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage, clientMessageId?: string): string {
+	appendMessage(
+		message: Message | CustomMessage | BashExecutionMessage,
+		clientMessageId?: string,
+		clientContent?: string,
+	): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
@@ -1221,7 +1225,13 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			message,
 			...(clientMessageId !== undefined
-				? { clientSubmission: { sessionId: this.sessionId, messageId: clientMessageId } }
+				? {
+						clientSubmission: {
+							sessionId: this.sessionId,
+							messageId: clientMessageId,
+							...(clientContent !== undefined ? { clientContent } : {}),
+						},
+					}
 				: {}),
 		};
 		this._appendEntry(entry);

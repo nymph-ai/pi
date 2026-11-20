@@ -25,7 +25,14 @@ import type { SourceInfo } from "../../core/source-info.ts";
 export type RpcCommand =
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
-	| { id?: string; type: "prompt_with_id"; message: string; images?: ImageContent[]; clientMessageId: string }
+	| {
+			id?: string;
+			type: "prompt_with_id";
+			message: string;
+			images?: ImageContent[];
+			clientMessageId: string;
+			clientContent?: string;
+	  }
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "steer_with_id"; message: string; clientMessageId: string }
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }

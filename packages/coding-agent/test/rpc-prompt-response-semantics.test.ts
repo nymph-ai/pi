@@ -212,15 +212,16 @@ describe("RPC prompt response semantics", () => {
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
 		});
-		const request = (id: string, message = "Hello") =>
-			JSON.stringify({ id, type: "prompt_with_id", clientMessageId: "one", message });
+		const clientContent = JSON.stringify([{ type: "resource_link", name: "fixture", uri: "fixture://original" }]);
+		const request = (id: string, message = "Hello", content = clientContent) =>
+			JSON.stringify({ id, type: "prompt_with_id", clientMessageId: "one", message, clientContent: content });
 		const receipts = (id: string) => getPromptResponses(rpcIo.outputLines, id, "prompt_with_id");
 		let entryId!: string;
 		try {
 			const first = await startRpcMode({ withAuth: true, responseDelayMs: 0, responseGate: gate, sessionManager });
 			try {
 				first.lineHandler(request("original"));
-				first.lineHandler(request("duplicate", "Do not insert this"));
+				first.lineHandler(request("duplicate", "Do not insert this", "changed client content"));
 				await vi.waitFor(() => {
 					expect(receipts("original")).toHaveLength(1);
 					expect(receipts("duplicate")).toHaveLength(1);
@@ -230,16 +231,16 @@ describe("RPC prompt response semantics", () => {
 				expect(users).toHaveLength(1);
 				expect(users[0]).toMatchObject({
 					message: { content: [{ type: "text", text: "Hello" }] },
-					clientSubmission: { sessionId: sessionManager.getSessionId(), messageId: "one" },
+					clientSubmission: { sessionId: sessionManager.getSessionId(), messageId: "one", clientContent },
 				});
 				entryId = users[0]!.id;
 				expect(receipts("original")[0]).toMatchObject({
 					success: true,
-					data: { clientMessageId: "one", entryId, disposition: "inserted" },
+					data: { clientMessageId: "one", entryId, disposition: "inserted", clientContent },
 				});
 				expect(receipts("duplicate")[0]).toMatchObject({
 					success: true,
-					data: { clientMessageId: "one", entryId, disposition: "reused" },
+					data: { clientMessageId: "one", entryId, disposition: "reused", clientContent },
 				});
 				expect(parseOutputLines(rpcIo.outputLines).some((record) => record.type === "agent_settled")).toBe(false);
 				release();
@@ -256,12 +257,12 @@ describe("RPC prompt response semantics", () => {
 				sessionManager: SessionManager.open(file),
 			});
 			try {
-				reopened.lineHandler(request("retry", "Do not insert this either"));
+				reopened.lineHandler(request("retry", "Do not insert this either", "changed again"));
 				await vi.waitFor(() =>
 					expect(receipts("retry")).toEqual([
 						expect.objectContaining({
 							success: true,
-							data: { clientMessageId: "one", entryId, disposition: "reused" },
+							data: { clientMessageId: "one", entryId, disposition: "reused", clientContent },
 						}),
 					]),
 				);

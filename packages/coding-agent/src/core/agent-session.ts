@@ -310,10 +310,16 @@ export interface ExtensionBindings {
 
 export type QueuedInputDisposition = "handled" | "queued";
 export type PromptDisposition = QueuedInputDisposition | "started";
-export type PromptInsertion = { clientMessageId: string; entryId: string; disposition: "inserted" | "reused" };
+export type PromptInsertion = {
+	clientMessageId: string;
+	entryId: string;
+	disposition: "inserted" | "reused";
+	clientContent?: string;
+};
 
 type RpcPromptSubmission = {
 	clientMessageId: string;
+	clientContent?: string;
 	inserted: (receipt: PromptInsertion) => void;
 	runScoped?: true;
 };
@@ -1174,10 +1180,19 @@ export class AgentSession {
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
 				const submission = this._rpcSubmissionByMessage.get(event.message);
-				entryId = this.sessionManager.appendMessage(event.message, submission?.clientMessageId);
+				entryId = this.sessionManager.appendMessage(
+					event.message,
+					submission?.clientMessageId,
+					submission?.clientContent,
+				);
 				if (submission) {
 					this._rpcSubmissionByMessage.delete(event.message);
-					submission.inserted({ clientMessageId: submission.clientMessageId, entryId, disposition: "inserted" });
+					submission.inserted({
+						clientMessageId: submission.clientMessageId,
+						entryId,
+						disposition: "inserted",
+						...(submission.clientContent !== undefined ? { clientContent: submission.clientContent } : {}),
+					});
 				}
 			}
 			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
@@ -2203,13 +2218,21 @@ export class AgentSession {
 	}
 
 	/** Insert a prompt once under a caller-supplied message ID, even after reopening the session. */
-	async submitRpcPrompt(text: string, clientMessageId: string, images?: ImageContent[]): Promise<PromptInsertion> {
+	async submitRpcPrompt(
+		text: string,
+		clientMessageId: string,
+		images?: ImageContent[],
+		clientContent?: string,
+	): Promise<PromptInsertion> {
 		this._validateRpcMessageId(clientMessageId);
+		if (clientContent !== undefined && typeof clientContent !== "string") {
+			throw new Error("clientContent must be a string.");
+		}
 		const pending = this._pendingRpcPrompts.get(clientMessageId);
 		if (pending) {
 			const receipt = await pending;
 			if (receipt) return { ...receipt, disposition: "reused" };
-			return this.submitRpcPrompt(text, clientMessageId, images);
+			return this.submitRpcPrompt(text, clientMessageId, images, clientContent);
 		}
 
 		const retained = this._retainedRpcInput(clientMessageId);
@@ -2222,7 +2245,7 @@ export class AgentSession {
 			void this.prompt(text, {
 				images,
 				source: "rpc",
-				rpcSubmission: { clientMessageId, inserted: resolve },
+				rpcSubmission: { clientMessageId, clientContent, inserted: resolve },
 			}).then(() => reject(new Error("Pi did not insert a user message for this prompt.")), reject);
 		});
 		return this._trackRpcInput(clientMessageId, insertion);
@@ -2289,7 +2312,14 @@ export class AgentSession {
 					entry.clientSubmission?.sessionId === sessionId &&
 					entry.clientSubmission.messageId === clientMessageId,
 			);
-		return retained && { clientMessageId, entryId: retained.id, disposition: "reused" };
+		if (retained?.type !== "message") return undefined;
+		const clientContent = retained.clientSubmission?.clientContent;
+		return {
+			clientMessageId,
+			entryId: retained.id,
+			disposition: "reused",
+			...(clientContent !== undefined ? { clientContent } : {}),
+		};
 	}
 
 	private _trackRpcInput<T extends PromptInsertion | null>(

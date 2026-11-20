@@ -61,6 +61,10 @@ session. If input handling consumes the prompt without inserting a user
 message, the command fails without a receipt. Clients should still follow
 `agent_settled` for the outcome of a newly inserted prompt.
 
+Optional `clientContent` stores an opaque string on the native user entry.
+Pi includes the original string in inserted and reused receipts. It supplies
+only `message` and `images` to the prompt processing path.
+
 ### steer
 
 Queue a steering message while the agent is running. It is delivered after the current assistant turn finishes executing its tool calls, before the next LLM call. Skill commands and prompt templates are expanded. Extension commands are not allowed (use `prompt` instead).

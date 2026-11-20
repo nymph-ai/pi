@@ -414,7 +414,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			case "prompt_with_id": {
-				const receipt = await session.submitRpcPrompt(command.message, command.clientMessageId, command.images);
+				const receipt = await session.submitRpcPrompt(
+					command.message,
+					command.clientMessageId,
+					command.images,
+					command.clientContent,
+				);
 				return success(id, "prompt_with_id", receipt);
 			}
 
